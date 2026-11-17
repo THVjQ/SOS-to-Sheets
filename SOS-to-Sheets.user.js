@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.0.1
+// @version      1.1.0
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.0.1';
+  const SCRIPT_VERSION = '1.1.0';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -268,7 +268,7 @@
   }
 
   // ═════════════════════════════════════════════════════════════
-  // Panel
+  // Popup
   // ═════════════════════════════════════════════════════════════
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -276,66 +276,96 @@
   const toHTML = (rows) => `<table>${rows.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</table>`;
   const LETTERS = 'ABCDEFGHIJKLMN'.split('');
 
+  const style = document.createElement('style');
+  style.textContent = `
+    #s2s-fab { position:fixed; bottom:20px; left:336px; width:44px; height:44px; border-radius:50%;
+      background:#16a34a; box-shadow:0 3px 14px rgba(22,163,74,.55); border:none; cursor:pointer;
+      z-index:99999; font-size:20px; display:flex; align-items:center; justify-content:center; }
+    #s2s-fab:hover { background:#15803d; }
+    #s2s-overlay { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:100000;
+      display:none; align-items:center; justify-content:center; padding:16px; }
+    #s2s-overlay.open { display:flex; }
+    #s2s-modal { background:#0f172a; color:#e2e8f0; border-radius:16px; width:min(1100px,100%);
+      max-height:calc(100vh - 32px); display:flex; flex-direction:column;
+      box-shadow:0 20px 60px rgba(0,0,0,.7); font-family:'Segoe UI',system-ui,sans-serif; font-size:13px; }
+    .s2s-head { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid #1e293b; }
+    .s2s-head h2 { margin:0; font-size:16px; font-weight:700; flex:1; }
+    .s2s-x { background:none; border:none; color:#94a3b8; font-size:22px; cursor:pointer; line-height:1; }
+    .s2s-x:hover { color:#fff; }
+    .s2s-bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:12px 18px; }
+    .s2s-bar input { padding:6px 8px; border-radius:8px; border:1px solid #334155; background:#1e293b; color:#e2e8f0; }
+    .s2s-btn { border-radius:8px; padding:7px 14px; cursor:pointer; font-size:13px; font-weight:600;
+      border:1px solid #334155; background:#1e293b; color:#e2e8f0; }
+    .s2s-btn:hover { background:#334155; }
+    .s2s-copy { background:#16a34a; border-color:#16a34a; color:#fff; padding:9px 22px; font-size:14px; margin-left:auto; }
+    .s2s-copy:hover { background:#15803d; }
+    .s2s-copy:disabled { opacity:.4; cursor:default; }
+    .s2s-body { padding:0 18px 12px; overflow:auto; flex:1; min-height:80px; }
+    .s2s-table { border-collapse:collapse; font-size:12px; width:max-content; }
+    .s2s-table th { position:sticky; top:0; background:#1e293b; padding:5px 8px; text-align:left; color:#94a3b8; }
+    .s2s-table td { padding:5px 8px; border-top:1px solid #1e293b; max-width:320px; overflow:hidden;
+      text-overflow:ellipsis; white-space:nowrap; }
+    .s2s-table tr.warn td { background:rgba(245,158,11,.12); }
+    .s2s-foot { padding:10px 18px; border-top:1px solid #1e293b; font-size:11px; color:#64748b; }
+    .s2s-msg { padding:10px 0; }
+  `;
+  document.head.appendChild(style);
+
   let latest = null;
 
   function renderInto(container) {
     container.innerHTML = `
-      <div style="padding:14px;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input id="s2s-day" type="date" value="${ymd(new Date())}" style="padding:4px 6px;border-radius:6px;border:1px solid rgba(128,128,128,.4);background:transparent;color:inherit">
-          <button id="s2s-fetch" style="background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:8px;padding:6px 12px;cursor:pointer;font-size:12px">Fetch</button>
-          <button id="s2s-copy" disabled style="background:#4f46e5;color:#fff;border:none;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:12px">Copy rows</button>
-        </div>
-        <div id="s2s-body" style="margin-top:12px;opacity:.7">Pick a day and press Fetch.</div>
-        <div style="margin-top:10px;font-size:11px;opacity:.55">v${SCRIPT_VERSION} · paste into column A of the first blank row</div>
+      <div class="s2s-bar">
+        <input class="s2s-day" type="date" value="${ymd(new Date())}">
+        <button class="s2s-btn s2s-fetch">↻ Refresh</button>
+        <span class="s2s-count" style="color:#94a3b8"></span>
+        <button class="s2s-btn s2s-copy" disabled>📋 Copy for Sheets</button>
       </div>
+      <div class="s2s-body"><div class="s2s-msg">Reading…</div></div>
+      <div class="s2s-foot">v${SCRIPT_VERSION} · Copy, then click column A of the first blank row in the sheet and press Ctrl+V</div>
     `;
-    const dayInput = container.querySelector('#s2s-day');
-    container.querySelector('#s2s-fetch').addEventListener('click', () => refresh(container, dayInput.value));
-    container.querySelector('#s2s-copy').addEventListener('click', () => copy(container));
+    const day = container.querySelector('.s2s-day');
+    container.querySelector('.s2s-fetch').addEventListener('click', () => refresh(container, day.value));
+    day.addEventListener('change', () => refresh(container, day.value));
+    container.querySelector('.s2s-copy').addEventListener('click', () => copy(container));
   }
 
   async function refresh(container, day) {
-    const body = container.querySelector('#s2s-body');
-    body.style.opacity = '.7';
-    body.textContent = 'Reading…';
+    const body = container.querySelector('.s2s-body');
+    container.querySelector('.s2s-copy').disabled = true;
+    container.querySelector('.s2s-count').textContent = '';
+    body.innerHTML = '<div class="s2s-msg">Reading…</div>';
     try {
       latest = await load(day);
     } catch (err) {
       latest = null;
-      body.innerHTML = `<div style="color:#f87171">Couldn't read the tickets: ${esc(err.message)}</div>`;
-      container.querySelector('#s2s-copy').disabled = true;
+      body.innerHTML = `<div class="s2s-msg" style="color:#f87171">Couldn't read the tickets: ${esc(err.message)}</div>`;
       return;
     }
     paint(container, day);
   }
 
   function paint(container, day) {
-    const body = container.querySelector('#s2s-body');
-    const copyBtn = container.querySelector('#s2s-copy');
-    body.style.opacity = '1';
-    copyBtn.disabled = !latest.rows.length;
+    const body = container.querySelector('.s2s-body');
+    const n = latest.rows.length;
+    container.querySelector('.s2s-copy').disabled = !n;
+    container.querySelector('.s2s-count').textContent = n ? `${n} row${n === 1 ? '' : 's'}` : '';
 
-    if (!latest.rows.length) {
-      body.innerHTML = `<div style="color:#f59e0b">Nothing marked ${STATUS} on ${esc(day)}.</div>`;
+    if (!n) {
+      body.innerHTML = `<div class="s2s-msg" style="color:#f59e0b">Nothing marked ${STATUS} on ${esc(day)}.</div>`;
       return;
     }
 
     const warned = latest.rows.filter((r) => r.warnings.length);
     body.innerHTML = `
-      <div style="margin-bottom:6px">${latest.rows.length} row${latest.rows.length === 1 ? '' : 's'}</div>
-      ${latest.truncated ? `<div style="margin-bottom:8px;color:#f59e0b">The server capped this read at ${MAX_ROWS} rows — the day is cut short.</div>` : ''}
-      <div style="max-height:260px;overflow:auto;border:1px solid rgba(128,128,128,.3);border-radius:8px">
-        <table style="border-collapse:collapse;font-size:11px;width:max-content">
-          <thead><tr>${LETTERS.map((l) => `<th style="position:sticky;top:0;background:rgba(128,128,128,.2);padding:3px 6px;text-align:left">${l}</th>`).join('')}</tr></thead>
-          <tbody>${latest.rows.map(({ row, warnings }) => `
-            <tr style="${warnings.length ? 'background:rgba(245,158,11,.12)' : ''}">
-              ${row.map((c) => `<td title="${esc(c)}" style="padding:3px 6px;border-top:1px solid rgba(128,128,128,.2);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c)}</td>`).join('')}
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>
-      ${warned.length ? `<div style="margin-top:8px;font-size:12px;color:#f59e0b">
+      ${latest.truncated ? `<div class="s2s-msg" style="color:#f59e0b">The server capped this read at ${MAX_ROWS} rows — the day is cut short.</div>` : ''}
+      <table class="s2s-table">
+        <thead><tr>${LETTERS.map((l) => `<th>${l}</th>`).join('')}</tr></thead>
+        <tbody>${latest.rows.map(({ row, warnings }) => `
+          <tr class="${warnings.length ? 'warn' : ''}">${row.map((c) => `<td title="${esc(c)}">${esc(c)}</td>`).join('')}</tr>`).join('')}
+        </tbody>
+      </table>
+      ${warned.length ? `<div class="s2s-msg" style="color:#f59e0b">
         ${warned.map((r) => `<div><b>${esc(r.ticket.ticket_number)}</b>: ${esc(r.warnings.join('; '))}</div>`).join('')}
       </div>` : ''}
     `;
@@ -344,7 +374,7 @@
   async function copy(container) {
     if (!latest?.rows.length) return;
     const rows = latest.rows.map((r) => r.row);
-    const btn = container.querySelector('#s2s-copy');
+    const btn = container.querySelector('.s2s-copy');
     try {
       if (navigator.clipboard?.write && typeof window.ClipboardItem === 'function') {
         // Both flavours: Sheets takes the HTML table and gets real cells.
@@ -355,15 +385,15 @@
       } else {
         await navigator.clipboard.writeText(toTSV(rows));
       }
-      btn.textContent = `Copied ${rows.length}`;
+      btn.textContent = `✓ Copied ${rows.length} row${rows.length === 1 ? '' : 's'}`;
     } catch {
-      btn.textContent = 'Copy blocked — select the table';
+      btn.textContent = 'Copy blocked — try again';
     }
-    setTimeout(() => { btn.textContent = 'Copy rows'; }, 2000);
+    setTimeout(() => { btn.textContent = '📋 Copy for Sheets'; }, 2500);
   }
 
   // ═════════════════════════════════════════════════════════════
-  // Dock registration
+  // Launch: the dock chip if the SOS Dock is installed, else our own button
   // ═════════════════════════════════════════════════════════════
 
   const config = {
@@ -371,33 +401,42 @@
     title: 'SOS → Sheets',
     icon: '📋',
     order: 15,
-    onOpen(container) { renderInto(container); },
+    onOpen(container) {
+      container.style.cssText += ';background:#0f172a;color:#e2e8f0';
+      renderInto(container);
+      refresh(container, ymd(new Date()));
+    },
   };
 
-  /**
-   * Without the SOS Dock there is nothing to draw the chip, so the script brings its own round
-   * button, bottom left in the same row as the Sales Loader (224px) and Ticket Loader (280px).
-   */
+  /** Bottom left, in the same row as the Sales Loader (224px) and Ticket Loader (280px). */
   function mountLegacyFab() {
     const fab = document.createElement('button');
     fab.id = 's2s-fab';
     fab.title = 'SOS → Sheets';
     fab.textContent = '📋';
-    fab.style.cssText = 'position:fixed;bottom:20px;left:336px;width:44px;height:44px;border-radius:50%;'
-      + 'background:#16a34a;box-shadow:0 3px 14px rgba(22,163,74,.55);border:none;cursor:pointer;'
-      + 'z-index:99999;font-size:20px;display:flex;align-items:center;justify-content:center';
 
-    const panel = document.createElement('div');
-    panel.id = 's2s-panel';
-    panel.style.cssText = 'position:fixed;bottom:72px;left:20px;width:min(720px,calc(100vw - 40px));'
-      + 'background:#0f172a;color:#e2e8f0;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.7);'
-      + 'z-index:99998;display:none';
-    renderInto(panel);
+    const overlay = document.createElement('div');
+    overlay.id = 's2s-overlay';
+    overlay.innerHTML = `
+      <div id="s2s-modal" role="dialog" aria-label="SOS to Sheets">
+        <div class="s2s-head"><h2>📋 SOS → Sheets · Paid &amp; Collected</h2><button class="s2s-x" title="Close">×</button></div>
+        <div class="s2s-content" style="display:flex;flex-direction:column;min-height:0;flex:1"></div>
+      </div>`;
+    const content = overlay.querySelector('.s2s-content');
+    renderInto(content);
 
-    fab.addEventListener('click', () => {
-      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-    });
-    document.body.append(panel, fab);
+    const close = () => overlay.classList.remove('open');
+    const open = () => {
+      overlay.classList.add('open');
+      // Fresh every time it opens — the sheet is filled from what is collected *now*.
+      refresh(content, content.querySelector('.s2s-day').value);
+    };
+
+    fab.addEventListener('click', () => (overlay.classList.contains('open') ? close() : open()));
+    overlay.querySelector('.s2s-x').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    document.body.append(overlay, fab);
   }
 
   if (window.SOSDock) window.SOSDock.register(config);
