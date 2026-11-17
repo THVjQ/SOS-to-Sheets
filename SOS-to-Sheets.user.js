@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.1.0
+// @version      1.2.0
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.1.0';
+  const SCRIPT_VERSION = '1.2.0';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -36,7 +36,7 @@
   //   G  User                 blank — filled in by hand
   //   H  User                 blank
   //   I  User                 blank
-  //   J  Contacted            "Message sent" / "YES" — see contactCell()
+  //   J  Contacted            "SMS" / "YES" — see contactCell()
   //   K  Total after discount
   //   L  Book                 blank
   //   M  "PIN"
@@ -44,13 +44,17 @@
 
   const STATUS = 'Paid & Collected';
 
+  /**
+   * Both sections share this row. The only difference is D: the collected section is all
+   * "Paid & Collected", the payments section shows whatever status the ticket is in now.
+   */
   function sheetRow(t, ctx) {
     const pay = ctx.paymentsFor(t);
     return [
-      sheetDate(t.collected_at),
+      sheetDate(`${ctx.day}T12:00:00`),
       '',
       t.ticket_number,
-      STATUS,
+      t.status || '',
       money(pay.cash),
       money(pay.eftpos),
       '',
@@ -70,7 +74,7 @@
    * Everything else is "YES" for now — NO has no rule yet.
    */
   function contactCell(t, notes) {
-    if ((notes || []).some((n) => /^\s*message sent\b/i.test(n.text || ''))) return 'Message sent';
+    if ((notes || []).some((n) => /^\s*message sent\b/i.test(n.text || ''))) return 'SMS';
     return 'YES';
   }
 
@@ -174,6 +178,11 @@
       { cash: Number(t.payment_cash) || 0, eftpos: Number(t.payment_eftpos) || 0, other: 0, fallback: true };
   }
 
+  /**
+   * @returns {{collected: Row[], paid: Row[]}} — `collected` is everything Paid & Collected on
+   * the day; `paid` is every other ticket that took a payment that day (deposits, part payments,
+   * a ticket collected another day), each once, never in both.
+   */
   function buildRows(data) {
     const group = (rows, key) => {
       const out = {};
@@ -184,18 +193,14 @@
     const addons = group(data.addons, 'ticket_id');
     const items = group(data.items, 'sale_id');
     const ctx = {
+      day: data.day,
       paymentsFor: paymentsIndex(data.transactions),
       notesFor: (t) => notes[t.id] || [],
       addonsFor: (t) => addons[t.id] || [],
       itemsFor: (t) => (t.sale_id && items[t.sale_id]) || [],
     };
 
-    // Oldest first: the sheet is a day log, and the API's default order is newest first.
-    const tickets = (data.tickets || [])
-      .filter((t) => t.status === STATUS)
-      .sort((a, b) => String(a.collected_at || '').localeCompare(String(b.collected_at || '')));
-
-    return tickets.map((t) => {
+    const toRow = (t) => {
       const p = ctx.paymentsFor(t);
       return {
         ticket: t,
@@ -205,7 +210,29 @@
           p.other && `$${money(p.other)} by transfer/other isn't in E or F`,
         ].filter(Boolean),
       };
-    });
+    };
+
+    const collected = (data.tickets || []).filter((t) => t.status === STATUS);
+    const taken = new Set(collected.map((t) => t.id));
+    const paid = (data.paidTickets || []).filter((t) => !taken.has(t.id) && (taken.add(t.id), true));
+
+    return {
+      collected: sortRows(collected.map(toRow), 'ticket'),
+      paid: sortRows(paid.map(toRow), 'ticket'),
+    };
+  }
+
+  /** "A5490" before "A5517", and A999 before A1000 — numeric-aware, not plain text order. */
+  const byTicket = (a, b) =>
+    String(a.ticket.ticket_number || '').localeCompare(String(b.ticket.ticket_number || ''), undefined, { numeric: true });
+  const byTime = (a, b) =>
+    String(a.ticket.collected_at || '').localeCompare(String(b.ticket.collected_at || '')) || byTicket(a, b);
+
+  /** 'manual' leaves the order as it stands — that is the order someone dragged it into. */
+  function sortRows(rows, mode) {
+    if (mode === 'ticket') return rows.slice().sort(byTicket);
+    if (mode === 'time') return rows.slice().sort(byTime);
+    return rows;
   }
 
   // ═════════════════════════════════════════════════════════════
@@ -238,31 +265,48 @@
     const store_id = storeId();
     if (!store_id) throw new Error('No active store selected.');
 
-    const tickets = await filter('Ticket', {
-      store_id,
-      status: STATUS,
-      collected_at: {
-        $gte: new Date(`${day}T00:00:00`).toISOString(),
-        $lte: new Date(`${day}T23:59:59.999`).toISOString(),
-      },
-    }, [
+    const fields = [
       'id', 'ticket_number', 'row_type', 'status', 'sale_id', 'refurb_sale_id', 'device', 'issue',
       'manual_issue', 'customer_name', 'customer_phone', 'customer_email', 'customer_name_snapshot',
       'customer_phone_snapshot', 'customer_email_snapshot', 'quote_amount', 'checkout_discount',
       'final_amount_due', 'payment_cash', 'payment_eftpos', 'collected_at',
-    ].join(','));
+    ].join(',');
 
-    const ids = tickets.map((t) => t.id);
-    const saleIds = tickets.map((t) => t.sale_id).filter(Boolean);
-    const [transactions, notes, addons, items] = await Promise.all([
+    const [tickets, transactions] = await Promise.all([
+      filter('Ticket', {
+        store_id,
+        status: STATUS,
+        collected_at: {
+          $gte: new Date(`${day}T00:00:00`).toISOString(),
+          $lte: new Date(`${day}T23:59:59.999`).toISOString(),
+        },
+      }, fields),
       filter('Transaction', { store_id, date: day }, 'ticket_id,ticket_number,type,method,amount'),
+    ]);
+
+    // Every other ticket that took a payment that day. Refund-only days don't count — the
+    // section is "paid on this day". Older Transactions can lack ticket_id, so match on number too.
+    const collectedIds = new Set(tickets.map((t) => t.id));
+    const payments = transactions.filter((tx) => tx.type === 'payment');
+    const payIds = [...new Set(payments.map((tx) => tx.ticket_id).filter((id) => id && !collectedIds.has(id)))];
+    const payNumbers = [...new Set(payments.filter((tx) => !tx.ticket_id && tx.ticket_number).map((tx) => tx.ticket_number))];
+    const [byId, byNumber] = await Promise.all([
+      payIds.length ? filterIn('Ticket', 'id', payIds, fields) : [],
+      payNumbers.length ? filter('Ticket', { store_id, ticket_number: { $in: payNumbers } }, fields) : [],
+    ]);
+    const paidTickets = [...byId, ...byNumber].filter((t) => !collectedIds.has(t.id));
+
+    const all = [...tickets, ...paidTickets];
+    const ids = all.map((t) => t.id);
+    const saleIds = all.map((t) => t.sale_id).filter(Boolean);
+    const [notes, addons, items] = await Promise.all([
       ids.length ? filterIn('TicketNote', 'ticket_id', ids, 'ticket_id,text') : [],
       ids.length ? filterIn('TicketAddon', 'ticket_id', ids, 'ticket_id,item_name,qty,unit_price,line_total') : [],
       saleIds.length ? filterIn('SaleItem', 'sale_id', saleIds, 'sale_id,item_name,price,position') : [],
     ]);
 
     return {
-      rows: buildRows({ tickets, transactions, notes, addons, items }),
+      ...buildRows({ day, tickets, paidTickets, transactions, notes, addons, items }),
       truncated: tickets.length >= MAX_ROWS || transactions.length >= MAX_ROWS,
     };
   }
@@ -297,11 +341,25 @@
     .s2s-btn { border-radius:8px; padding:7px 14px; cursor:pointer; font-size:13px; font-weight:600;
       border:1px solid #334155; background:#1e293b; color:#e2e8f0; }
     .s2s-btn:hover { background:#334155; }
-    .s2s-copy { background:#16a34a; border-color:#16a34a; color:#fff; padding:9px 22px; font-size:14px; margin-left:auto; }
+    .s2s-copy { background:#16a34a; border-color:#16a34a; color:#fff; padding:8px 18px; }
     .s2s-copy:hover { background:#15803d; }
     .s2s-copy:disabled { opacity:.4; cursor:default; }
     .s2s-body { padding:0 18px 12px; overflow:auto; flex:1; min-height:80px; }
     .s2s-table { border-collapse:collapse; font-size:12px; width:max-content; }
+    .s2s-section { margin-bottom:18px; }
+    .s2s-sechead { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+    .s2s-sechead h3 { margin:0; font-size:14px; font-weight:700; }
+    .s2s-count { color:#94a3b8; flex:1; }
+    .s2s-sort { color:#94a3b8; font-size:12px; display:flex; align-items:center; gap:6px; }
+    .s2s-sort select { padding:5px 6px; border-radius:8px; border:1px solid #334155; background:#1e293b; color:#e2e8f0; }
+    .s2s-scroll { overflow:auto; max-height:40vh; border:1px solid #1e293b; border-radius:8px; }
+    .s2s-move { white-space:nowrap; }
+    .s2s-move button { background:none; border:none; color:#94a3b8; cursor:pointer; padding:0 3px; font-size:13px; }
+    .s2s-move button:hover:not(:disabled) { color:#fff; }
+    .s2s-move button:disabled { opacity:.25; cursor:default; }
+    .s2s-grip { cursor:grab; color:#64748b; padding-right:4px; }
+    .s2s-table tr.dragging td { opacity:.4; }
+    .s2s-table tr.over td { border-top:2px solid #16a34a; }
     .s2s-table th { position:sticky; top:0; background:#1e293b; padding:5px 8px; text-align:left; color:#94a3b8; }
     .s2s-table td { padding:5px 8px; border-top:1px solid #1e293b; max-width:320px; overflow:hidden;
       text-overflow:ellipsis; white-space:nowrap; }
@@ -313,27 +371,35 @@
 
   let latest = null;
 
+  /** The two sections, in the order they appear. Sort choice is remembered per section. */
+  const SECTIONS = [
+    { key: 'collected', title: 'Paid & Collected', empty: `Nothing marked ${STATUS} on this day.` },
+    { key: 'paid', title: 'Other payments taken this day', empty: 'No other tickets took a payment this day.' },
+  ];
+  const SORT_KEY = 's2s_sort';
+  const sortPrefs = (() => { try { return JSON.parse(localStorage.getItem(SORT_KEY) || '{}'); } catch { return {}; } })();
+  const sortFor = (key) => sortPrefs[key] || 'ticket';
+  function setSort(key, mode) {
+    sortPrefs[key] = mode;
+    try { localStorage.setItem(SORT_KEY, JSON.stringify(sortPrefs)); } catch { /* not fatal */ }
+  }
+
   function renderInto(container) {
     container.innerHTML = `
       <div class="s2s-bar">
         <input class="s2s-day" type="date" value="${ymd(new Date())}">
         <button class="s2s-btn s2s-fetch">↻ Refresh</button>
-        <span class="s2s-count" style="color:#94a3b8"></span>
-        <button class="s2s-btn s2s-copy" disabled>📋 Copy for Sheets</button>
       </div>
       <div class="s2s-body"><div class="s2s-msg">Reading…</div></div>
-      <div class="s2s-foot">v${SCRIPT_VERSION} · Copy, then click column A of the first blank row in the sheet and press Ctrl+V</div>
+      <div class="s2s-foot">v${SCRIPT_VERSION} · Copy a section, then click column A of the first blank row in the sheet and press Ctrl+V. Drag ⠿ or use ↑↓ to put rows in your own order.</div>
     `;
     const day = container.querySelector('.s2s-day');
     container.querySelector('.s2s-fetch').addEventListener('click', () => refresh(container, day.value));
     day.addEventListener('change', () => refresh(container, day.value));
-    container.querySelector('.s2s-copy').addEventListener('click', () => copy(container));
   }
 
   async function refresh(container, day) {
     const body = container.querySelector('.s2s-body');
-    container.querySelector('.s2s-copy').disabled = true;
-    container.querySelector('.s2s-count').textContent = '';
     body.innerHTML = '<div class="s2s-msg">Reading…</div>';
     try {
       latest = await load(day);
@@ -342,39 +408,97 @@
       body.innerHTML = `<div class="s2s-msg" style="color:#f87171">Couldn't read the tickets: ${esc(err.message)}</div>`;
       return;
     }
-    paint(container, day);
+    for (const s of SECTIONS) latest[s.key] = sortRows(latest[s.key], sortFor(s.key));
+    paint(container);
   }
 
-  function paint(container, day) {
+  function paint(container) {
     const body = container.querySelector('.s2s-body');
-    const n = latest.rows.length;
-    container.querySelector('.s2s-copy').disabled = !n;
-    container.querySelector('.s2s-count').textContent = n ? `${n} row${n === 1 ? '' : 's'}` : '';
-
-    if (!n) {
-      body.innerHTML = `<div class="s2s-msg" style="color:#f59e0b">Nothing marked ${STATUS} on ${esc(day)}.</div>`;
-      return;
-    }
-
-    const warned = latest.rows.filter((r) => r.warnings.length);
     body.innerHTML = `
       ${latest.truncated ? `<div class="s2s-msg" style="color:#f59e0b">The server capped this read at ${MAX_ROWS} rows — the day is cut short.</div>` : ''}
-      <table class="s2s-table">
-        <thead><tr>${LETTERS.map((l) => `<th>${l}</th>`).join('')}</tr></thead>
-        <tbody>${latest.rows.map(({ row, warnings }) => `
-          <tr class="${warnings.length ? 'warn' : ''}">${row.map((c) => `<td title="${esc(c)}">${esc(c)}</td>`).join('')}</tr>`).join('')}
-        </tbody>
-      </table>
-      ${warned.length ? `<div class="s2s-msg" style="color:#f59e0b">
-        ${warned.map((r) => `<div><b>${esc(r.ticket.ticket_number)}</b>: ${esc(r.warnings.join('; '))}</div>`).join('')}
-      </div>` : ''}
+      ${SECTIONS.map((s) => sectionHTML(s, latest[s.key])).join('')}
     `;
+    wire(container);
   }
 
-  async function copy(container) {
-    if (!latest?.rows.length) return;
-    const rows = latest.rows.map((r) => r.row);
-    const btn = container.querySelector('.s2s-copy');
+  function sectionHTML(s, rows) {
+    const n = rows.length;
+    const mode = sortFor(s.key);
+    const warned = rows.filter((r) => r.warnings.length);
+    return `
+      <div class="s2s-section" data-section="${s.key}">
+        <div class="s2s-sechead">
+          <h3>${esc(s.title)}</h3>
+          <span class="s2s-count">${n} row${n === 1 ? '' : 's'}</span>
+          <label class="s2s-sort">Sort
+            <select class="s2s-sortsel">
+              <option value="ticket"${mode === 'ticket' ? ' selected' : ''}>Ticket #</option>
+              <option value="time"${mode === 'time' ? ' selected' : ''}>Time collected</option>
+              <option value="manual"${mode === 'manual' ? ' selected' : ''}>Manual</option>
+            </select>
+          </label>
+          <button class="s2s-btn s2s-copy"${n ? '' : ' disabled'}>📋 Copy ${n} row${n === 1 ? '' : 's'}</button>
+        </div>
+        ${n ? `
+        <div class="s2s-scroll">
+          <table class="s2s-table">
+            <thead><tr><th></th>${LETTERS.map((l) => `<th>${l}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map(({ row, warnings }, i) => `
+              <tr class="${warnings.length ? 'warn' : ''}" draggable="true" data-i="${i}">
+                <td class="s2s-move"><span class="s2s-grip" title="Drag to move">⠿</span><button class="s2s-up" title="Move up"${i ? '' : ' disabled'}>↑</button><button class="s2s-down" title="Move down"${i < n - 1 ? '' : ' disabled'}>↓</button></td>
+                ${row.map((c) => `<td title="${esc(c)}">${esc(c)}</td>`).join('')}
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        ${warned.length ? `<div class="s2s-msg" style="color:#f59e0b">
+          ${warned.map((r) => `<div><b>${esc(r.ticket.ticket_number)}</b>: ${esc(r.warnings.join('; '))}</div>`).join('')}
+        </div>` : ''}` : `<div class="s2s-msg" style="color:#94a3b8">${esc(s.empty)}</div>`}
+      </div>`;
+  }
+
+  /** Moving a row by hand switches that section to Manual, so a re-sort doesn't undo it. */
+  function move(container, key, from, to) {
+    const rows = latest[key];
+    if (to < 0 || to >= rows.length || from === to) return;
+    const [r] = rows.splice(from, 1);
+    rows.splice(to, 0, r);
+    setSort(key, 'manual');
+    paint(container);
+  }
+
+  function wire(container) {
+    container.querySelectorAll('.s2s-section').forEach((sec) => {
+      const key = sec.dataset.section;
+      sec.querySelector('.s2s-sortsel').addEventListener('change', (e) => {
+        setSort(key, e.target.value);
+        latest[key] = sortRows(latest[key], e.target.value);
+        paint(container);
+      });
+      sec.querySelector('.s2s-copy').addEventListener('click', (e) => copy(e.currentTarget, latest[key]));
+
+      let dragFrom = null;
+      sec.querySelectorAll('tbody tr').forEach((tr) => {
+        const i = Number(tr.dataset.i);
+        tr.querySelector('.s2s-up').addEventListener('click', () => move(container, key, i, i - 1));
+        tr.querySelector('.s2s-down').addEventListener('click', () => move(container, key, i, i + 1));
+        tr.addEventListener('dragstart', (e) => { dragFrom = i; e.dataTransfer.effectAllowed = 'move'; tr.classList.add('dragging'); });
+        tr.addEventListener('dragend', () => tr.classList.remove('dragging'));
+        tr.addEventListener('dragover', (e) => { if (dragFrom !== null) { e.preventDefault(); tr.classList.add('over'); } });
+        tr.addEventListener('dragleave', () => tr.classList.remove('over'));
+        tr.addEventListener('drop', (e) => {
+          e.preventDefault();
+          if (dragFrom !== null) move(container, key, dragFrom, i);
+          dragFrom = null;
+        });
+      });
+    });
+  }
+
+  async function copy(btn, sectionRows) {
+    if (!sectionRows?.length) return;
+    const rows = sectionRows.map((r) => r.row);
+    const label = btn.textContent;
     try {
       if (navigator.clipboard?.write && typeof window.ClipboardItem === 'function') {
         // Both flavours: Sheets takes the HTML table and gets real cells.
@@ -389,7 +513,7 @@
     } catch {
       btn.textContent = 'Copy blocked — try again';
     }
-    setTimeout(() => { btn.textContent = '📋 Copy for Sheets'; }, 2500);
+    setTimeout(() => { btn.textContent = label; }, 2500);
   }
 
   // ═════════════════════════════════════════════════════════════
@@ -419,7 +543,7 @@
     overlay.id = 's2s-overlay';
     overlay.innerHTML = `
       <div id="s2s-modal" role="dialog" aria-label="SOS to Sheets">
-        <div class="s2s-head"><h2>📋 SOS → Sheets · Paid &amp; Collected</h2><button class="s2s-x" title="Close">×</button></div>
+        <div class="s2s-head"><h2>📋 SOS → Sheets</h2><button class="s2s-x" title="Close">×</button></div>
         <div class="s2s-content" style="display:flex;flex-direction:column;min-height:0;flex:1"></div>
       </div>`;
     const content = overlay.querySelector('.s2s-content');
