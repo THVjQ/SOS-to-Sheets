@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.2.0
+// @version      1.3.0
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.2.0';
+  const SCRIPT_VERSION = '1.3.0';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -40,7 +40,7 @@
   //   K  Total after discount
   //   L  Book                 blank
   //   M  "PIN"
-  //   N  Name - Number - Email - Device - Issue    |   Walkin - Item $40 - Item $20
+  //   N  Name - Number - Email - Device - Issue    |   Walkin - #SKU $595 Model - Item $40 - Item $20
 
   const STATUS = 'Paid & Collected';
 
@@ -64,7 +64,7 @@
       money(totalAfterDiscount(t, ctx.addonsFor(t))),
       '',
       'PIN',
-      isWalkin(t) ? describeWalkin(t, ctx.itemsFor(t)) : describeTicket(t),
+      isWalkin(t) ? describeWalkin(t, ctx.itemsFor(t), ctx.unitsFor(t)) : describeTicket(t),
     ].map(safeCell);
   }
 
@@ -141,8 +141,18 @@
     ].map(cleanCell).filter(Boolean).join(' - ');
   }
 
-  /** Walkin - Wireless charger $50 - Case $20. Falls back to the board label for refurb sales. */
-  function describeWalkin(t, items) {
+  /**
+   * Walkin - #SKU $595 Samsung Galaxy S23 128GB Black - Data transfer $30 - Silicon case $20.
+   *
+   * A refurb handset isn't a SaleItem — it's a RefurbSale row pointing at RefurbStock — so it
+   * comes in as `units` and goes first, the way it reads on the docket. Accessories follow.
+   */
+  function describeWalkin(t, items, units) {
+    const phones = (units || []).map((u) => {
+      const price = money(u.price);
+      return [u.sku ? `#${cleanCell(u.sku)}` : '', price ? `$${price}` : '', cleanCell(u.label)]
+        .filter(Boolean).join(' ');
+    }).filter(Boolean);
     const parts = (items || [])
       .slice()
       .sort((a, b) => (a.position || 0) - (b.position || 0))
@@ -150,11 +160,11 @@
         const price = money(i.price);
         return `${cleanCell(i.item_name)}${price ? ` $${price}` : ''}`;
       });
-    if (!parts.length && cleanCell(t.device)) {
+    if (!parts.length && !phones.length && cleanCell(t.device)) {
       const price = money(t.quote_amount);
       parts.push(`${cleanCell(t.device)}${price ? ` $${price}` : ''}`);
     }
-    return ['Walkin', ...parts].join(' - ');
+    return ['Walkin', ...phones, ...parts].join(' - ');
   }
 
   /**
@@ -192,8 +202,10 @@
     const notes = group(data.notes, 'ticket_id');
     const addons = group(data.addons, 'ticket_id');
     const items = group(data.items, 'sale_id');
+    const units = group(data.units, 'ticket_id');
     const ctx = {
       day: data.day,
+      unitsFor: (t) => units[t.id] || [],
       paymentsFor: paymentsIndex(data.transactions),
       notesFor: (t) => notes[t.id] || [],
       addonsFor: (t) => addons[t.id] || [],
@@ -261,6 +273,42 @@
     return out;
   }
 
+  /**
+   * The handsets on refurb sales, one entry per unit: { ticket_id, sku, price, label }.
+   *
+   * A sale can carry several units, each its own RefurbSale with `ticket_id` set. Older ones may
+   * predate that link, so the ticket's own `refurb_sale_id` is read as well and pinned to it.
+   */
+  async function loadRefurbUnits(tickets) {
+    const ticketIds = tickets.map((t) => t.id);
+    const saleFields = 'id,ticket_id,stock_id,sell_price_at_sale,total,created_date';
+    const [linked, direct] = await Promise.all([
+      filterIn('RefurbSale', 'ticket_id', ticketIds, saleFields),
+      filterIn('RefurbSale', 'id', tickets.map((t) => t.refurb_sale_id), saleFields),
+    ]);
+    const owner = Object.fromEntries(tickets.map((t) => [t.refurb_sale_id, t.id]));
+    const sales = new Map();
+    for (const rs of [...linked, ...direct]) sales.set(rs.id, { ...rs, ticket_id: rs.ticket_id || owner[rs.id] });
+
+    const stockIds = [...new Set([...sales.values()].map((rs) => rs.stock_id).filter(Boolean))];
+    const stock = stockIds.length
+      ? Object.fromEntries((await filterIn('RefurbStock', 'id', stockIds, 'id,sku,brand,model,storage,colour,sell_price'))
+        .map((u) => [u.id, u]))
+      : {};
+
+    return [...sales.values()]
+      .sort((a, b) => String(a.created_date || '').localeCompare(String(b.created_date || '')))
+      .map((rs) => {
+        const u = stock[rs.stock_id] || {};
+        return {
+          ticket_id: rs.ticket_id,
+          sku: u.sku,
+          price: rs.sell_price_at_sale || rs.total || u.sell_price,
+          label: [u.brand, u.model, u.storage, u.colour].map(cleanCell).filter(Boolean).join(' '),
+        };
+      });
+  }
+
   async function load(day) {
     const store_id = storeId();
     if (!store_id) throw new Error('No active store selected.');
@@ -299,14 +347,16 @@
     const all = [...tickets, ...paidTickets];
     const ids = all.map((t) => t.id);
     const saleIds = all.map((t) => t.sale_id).filter(Boolean);
-    const [notes, addons, items] = await Promise.all([
+    const refurbTickets = all.filter((t) => t.refurb_sale_id);
+    const [notes, addons, items, units] = await Promise.all([
       ids.length ? filterIn('TicketNote', 'ticket_id', ids, 'ticket_id,text') : [],
       ids.length ? filterIn('TicketAddon', 'ticket_id', ids, 'ticket_id,item_name,qty,unit_price,line_total') : [],
       saleIds.length ? filterIn('SaleItem', 'sale_id', saleIds, 'sale_id,item_name,price,position') : [],
+      refurbTickets.length ? loadRefurbUnits(refurbTickets) : [],
     ]);
 
     return {
-      ...buildRows({ day, tickets, paidTickets, transactions, notes, addons, items }),
+      ...buildRows({ day, tickets, paidTickets, transactions, notes, addons, items, units }),
       truncated: tickets.length >= MAX_ROWS || transactions.length >= MAX_ROWS,
     };
   }
