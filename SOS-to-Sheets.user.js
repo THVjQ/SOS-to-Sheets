@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.0.0
+// @version      1.0.1
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.0.0';
+  const SCRIPT_VERSION = '1.0.1';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -374,10 +374,41 @@
     onOpen(container) { renderInto(container); },
   };
 
+  /**
+   * Without the SOS Dock there is nothing to draw the chip, so the script brings its own round
+   * button, bottom left in the same row as the Sales Loader (224px) and Ticket Loader (280px).
+   */
+  function mountLegacyFab() {
+    const fab = document.createElement('button');
+    fab.id = 's2s-fab';
+    fab.title = 'SOS → Sheets';
+    fab.textContent = '📋';
+    fab.style.cssText = 'position:fixed;bottom:20px;left:336px;width:44px;height:44px;border-radius:50%;'
+      + 'background:#16a34a;box-shadow:0 3px 14px rgba(22,163,74,.55);border:none;cursor:pointer;'
+      + 'z-index:99999;font-size:20px;display:flex;align-items:center;justify-content:center';
+
+    const panel = document.createElement('div');
+    panel.id = 's2s-panel';
+    panel.style.cssText = 'position:fixed;bottom:72px;left:20px;width:min(720px,calc(100vw - 40px));'
+      + 'background:#0f172a;color:#e2e8f0;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.7);'
+      + 'z-index:99998;display:none';
+    renderInto(panel);
+
+    fab.addEventListener('click', () => {
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    });
+    document.body.append(panel, fab);
+  }
+
   if (window.SOSDock) window.SOSDock.register(config);
   else {
     window.__SOSDockQueue__ = window.__SOSDockQueue__ || [];
     window.__SOSDockQueue__.push(config);
+    setTimeout(() => {
+      if (window.SOSDock) return;
+      console.warn('[SOS to Sheets] SOS Dock not present — using the legacy button.');
+      mountLegacyFab();
+    }, 3000);
   }
 
   // Exposed for the test and for checking a row by hand from the console.
