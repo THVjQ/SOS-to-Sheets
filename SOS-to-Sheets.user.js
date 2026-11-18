@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.3.0
+// @version      1.4.0
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.3.0';
+  const SCRIPT_VERSION = '1.4.0';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -40,7 +40,7 @@
   //   K  Total after discount
   //   L  Book                 blank
   //   M  "PIN"
-  //   N  Name - Number - Email - Device - Issue    |   Walkin - #SKU $595 Model - Item $40 - Item $20
+  //   N  Name - Number - Email - Device - Issues - Part Warranty $cost …    |   Walkin - #SKU $595 Model - Item $40 - Item $20
 
   const STATUS = 'Paid & Collected';
 
@@ -64,7 +64,7 @@
       money(totalAfterDiscount(t, ctx.addonsFor(t))),
       '',
       'PIN',
-      isWalkin(t) ? describeWalkin(t, ctx.itemsFor(t), ctx.unitsFor(t)) : describeTicket(t),
+      isWalkin(t) ? describeWalkin(t, ctx.itemsFor(t), ctx.unitsFor(t)) : describeTicket(t, ctx.issuesFor(t), ctx.partsFor(t)),
     ].map(safeCell);
   }
 
@@ -130,15 +130,34 @@
     return (Number(t.quote_amount) || 0) + extras - (Number(t.checkout_discount) || 0);
   }
 
-  /** Madelyn Vanderwalt - 0430 281 559 - Apple iPhone 11 - Screen LT (blank parts skipped). */
-  function describeTicket(t) {
+  /**
+   * Maisie Morrow - 0439 281 184 - maisie@… - Samsung A56 5G - Screen, Battery - Screen OLED LT $120 - Battery 6m $35
+   *
+   * Issues are the ticket's old single `issue` text plus its TicketIssue list (newer tickets only
+   * fill the list), de-duplicated. Then one entry per fitted part: name, warranty, what it cost.
+   * Blank pieces are skipped rather than leaving "- -" gaps.
+   */
+  function describeTicket(t, issueNames, parts) {
+    const issues = [];
+    for (const name of [t.issue || t.manual_issue, ...(issueNames || [])].map(cleanCell)) {
+      if (name && !issues.some((i) => i.toLowerCase() === name.toLowerCase())) issues.push(name);
+    }
+    const fitted = (parts || []).map((p) => {
+      const qty = Number(p.qty) || 1;
+      const cost = p.cost == null ? '' : money(Number(p.cost) * qty);
+      return [
+        `${qty > 1 ? `${qty} × ` : ''}${cleanCell(p.name_snapshot)}`,
+        cleanCell(p.warranty),
+        cost ? `$${cost}` : '',
+      ].filter(Boolean).join(' ');
+    });
     return [
       t.customer_name_snapshot || t.customer_name,
       t.customer_phone_snapshot || t.customer_phone,
       t.customer_email_snapshot || t.customer_email,
       t.device,
-      t.issue || t.manual_issue,
-    ].map(cleanCell).filter(Boolean).join(' - ');
+      issues.join(', '),
+    ].map(cleanCell).concat(fitted).filter(Boolean).join(' - ');
   }
 
   /**
@@ -203,8 +222,16 @@
     const addons = group(data.addons, 'ticket_id');
     const items = group(data.items, 'sale_id');
     const units = group(data.units, 'ticket_id');
+    const parts = group(data.parts, 'ticket_id');
+    const issueName = Object.fromEntries((data.issueCatalogue || []).map((i) => [i.id, i.issue_name]));
+    const issues = {};
+    for (const ti of data.ticketIssues || []) {
+      if (issueName[ti.issue_id]) (issues[ti.ticket_id] ||= []).push(issueName[ti.issue_id]);
+    }
     const ctx = {
       day: data.day,
+      partsFor: (t) => (parts[t.id] || []).slice().sort((a, b) => String(a.created_date || '').localeCompare(String(b.created_date || ''))),
+      issuesFor: (t) => issues[t.id] || [],
       unitsFor: (t) => units[t.id] || [],
       paymentsFor: paymentsIndex(data.transactions),
       notesFor: (t) => notes[t.id] || [],
@@ -348,15 +375,20 @@
     const ids = all.map((t) => t.id);
     const saleIds = all.map((t) => t.sale_id).filter(Boolean);
     const refurbTickets = all.filter((t) => t.refurb_sale_id);
-    const [notes, addons, items, units] = await Promise.all([
+    const repairIds = all.filter((t) => !isWalkin(t)).map((t) => t.id);
+    const [notes, addons, items, units, parts, ticketIssues] = await Promise.all([
       ids.length ? filterIn('TicketNote', 'ticket_id', ids, 'ticket_id,text') : [],
       ids.length ? filterIn('TicketAddon', 'ticket_id', ids, 'ticket_id,item_name,qty,unit_price,line_total') : [],
       saleIds.length ? filterIn('SaleItem', 'sale_id', saleIds, 'sale_id,item_name,price,position') : [],
       refurbTickets.length ? loadRefurbUnits(refurbTickets) : [],
+      repairIds.length ? filterIn('PartUsage', 'ticket_id', repairIds, 'ticket_id,name_snapshot,qty,warranty,cost,created_date') : [],
+      repairIds.length ? filterIn('TicketIssue', 'ticket_id', repairIds, 'ticket_id,issue_id,created_date') : [],
     ]);
+    const issueIds = [...new Set(ticketIssues.map((ti) => ti.issue_id).filter(Boolean))];
+    const issueCatalogue = issueIds.length ? await filterIn('IssueCatalogue', 'id', issueIds, 'id,issue_name') : [];
 
     return {
-      ...buildRows({ day, tickets, paidTickets, transactions, notes, addons, items, units }),
+      ...buildRows({ day, tickets, paidTickets, transactions, notes, addons, items, units, parts, ticketIssues, issueCatalogue }),
       truncated: tickets.length >= MAX_ROWS || transactions.length >= MAX_ROWS,
     };
   }
