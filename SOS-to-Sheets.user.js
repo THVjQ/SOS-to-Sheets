@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS to Sheets
 // @namespace    https://github.com/THVjQ
-// @version      1.4.0
+// @version      1.4.1
 // @description  Every ticket and walk-in sale marked Paid & Collected on a day, laid out as tracking-sheet rows (A–N) ready to paste. Read-only: it changes nothing in SOS POS.
 // @author       THVjQ
 // @match        https://app.sospos.com.au/*
@@ -17,7 +17,7 @@
   window.__sosToSheetsLoaded__ = true;
 
   // Keep in lock-step with @version — the TM Script Manager strips the header before eval.
-  const SCRIPT_VERSION = '1.4.0';
+  const SCRIPT_VERSION = '1.4.1';
 
   const API = '/api/entities';
   /** The filter route caps `take` here and truncates silently past it. */
@@ -130,6 +130,27 @@
     return (Number(t.quote_amount) || 0) + extras - (Number(t.checkout_discount) || 0);
   }
 
+  /** Words that name a phone rather than a part, stripped even when the device field omits them. */
+  const MAKER_WORDS = new Set(['apple', 'samsung', 'galaxy', 'iphone', 'ipad', 'google', 'pixel', 'oppo',
+    'motorola', 'moto', 'huawei', 'xiaomi', 'nokia', 'sony', 'xperia', 'for']);
+
+  /**
+   * "A56 Screen OLED" on a Samsung A56 5G (A566) → "Screen OLED". The row already names the phone
+   * once, so each part drops the model words it leads with. Only the *leading* run goes — a word
+   * matching the device later in the name (a "5G" antenna, say) is part of what the part is.
+   * Never strips down to nothing.
+   */
+  function partName(name, device) {
+    const norm = (w) => w.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const deviceWords = new Set(cleanCell(device).split(' ').map(norm).filter(Boolean));
+    const words = cleanCell(name).split(' ');
+    let i = 0;
+    // A bracketed size or model code in that leading run — "(10.2)", "(A566)" — goes with it.
+    const isModel = (w) => deviceWords.has(norm(w)) || MAKER_WORDS.has(norm(w)) || !norm(w) || /^\(.*\)$/.test(w);
+    while (i < words.length - 1 && isModel(words[i])) i++;
+    return words.slice(i).join(' ');
+  }
+
   /**
    * Maisie Morrow - 0439 281 184 - maisie@… - Samsung A56 5G - Screen, Battery - Screen OLED LT $120 - Battery 6m $35
    *
@@ -146,7 +167,7 @@
       const qty = Number(p.qty) || 1;
       const cost = p.cost == null ? '' : money(Number(p.cost) * qty);
       return [
-        `${qty > 1 ? `${qty} × ` : ''}${cleanCell(p.name_snapshot)}`,
+        `${qty > 1 ? `${qty} × ` : ''}${partName(p.name_snapshot, t.device)}`,
         cleanCell(p.warranty),
         cost ? `$${cost}` : '',
       ].filter(Boolean).join(' ');
